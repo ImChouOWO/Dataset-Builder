@@ -1,6 +1,6 @@
 # YOLO Dataset Builder
 
-一個跨平台的 YOLO 訓練資料集自動化工具，可在 macOS、Windows、Ubuntu 上以 Python 執行，也可以用 PyInstaller 打包成各平台執行檔。
+一個跨平台的 YOLO 訓練資料集自動化工具。
 
 ![image](https://github.com/ImChouOWO/Dataset-Builder/blob/main/img/img.png)
 
