@@ -13,6 +13,7 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Callable
+from PIL import Image
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 DEFAULT_IMAGE_DIR_NAMES = "images,img,imgs,image"
@@ -52,6 +53,125 @@ class BuildConfig:
     overwrite: bool = False
     include_unlabeled: bool = False
     seed: int = 42
+
+    resize_enabled: bool = False
+    resize_width: int = 640
+    resize_height: int = 640
+    resize_pad_black: bool = True
+
+def resize_image_yolo(
+    src_img: Path,
+    dst_img: Path,
+    target_w: int,
+    target_h: int,
+    pad_black: bool = True,
+) -> Tuple[int, int, float, float, float, float]:
+    """
+    回傳:
+    src_w, src_h, scale_x, scale_y, pad_x, pad_y
+
+    pad_black=True:
+        letterbox，保持比例並補黑邊
+    pad_black=False:
+        直接拉伸到指定大小，不補黑邊
+    """
+    with Image.open(src_img) as im:
+        im = im.convert("RGB")
+        src_w, src_h = im.size
+
+        if pad_black:
+            scale = min(target_w / src_w, target_h / src_h)
+            new_w = int(round(src_w * scale))
+            new_h = int(round(src_h * scale))
+
+            resized = im.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+            canvas = Image.new("RGB", (target_w, target_h), (0, 0, 0))
+            pad_x = (target_w - new_w) / 2.0
+            pad_y = (target_h - new_h) / 2.0
+
+            canvas.paste(resized, (int(round(pad_x)), int(round(pad_y))))
+            canvas.save(dst_img)
+
+            return src_w, src_h, scale, scale, pad_x, pad_y
+
+        else:
+            resized = im.resize((target_w, target_h), Image.Resampling.LANCZOS)
+            resized.save(dst_img)
+
+            scale_x = target_w / src_w
+            scale_y = target_h / src_h
+
+            return src_w, src_h, scale_x, scale_y, 0.0, 0.0
+
+
+def rewrite_label_text_with_resize(
+    label_text: str,
+    merge_rules: Dict[int, int],
+    src_w: int,
+    src_h: int,
+    dst_w: int,
+    dst_h: int,
+    scale_x: float,
+    scale_y: float,
+    pad_x: float,
+    pad_y: float,
+) -> Tuple[str, Counter]:
+    output_lines: List[str] = []
+    counter: Counter = Counter()
+
+    for line_no, raw_line in enumerate(label_text.splitlines(), start=1):
+        line = raw_line.strip()
+
+        if not line:
+            continue
+
+        parts = line.split()
+
+        if len(parts) < 5:
+            raise ValueError(f"Invalid YOLO label line {line_no}: '{raw_line}'")
+
+        try:
+            src_id = int(float(parts[0]))
+            x = float(parts[1])
+            y = float(parts[2])
+            w = float(parts[3])
+            h = float(parts[4])
+        except ValueError as exc:
+            raise ValueError(f"Invalid YOLO label line {line_no}: '{raw_line}'") from exc
+
+        dst_id = merge_rules.get(src_id, src_id)
+
+        x_abs = x * src_w
+        y_abs = y * src_h
+        w_abs = w * src_w
+        h_abs = h * src_h
+
+        x_new = x_abs * scale_x + pad_x
+        y_new = y_abs * scale_y + pad_y
+        w_new = w_abs * scale_x
+        h_new = h_abs * scale_y
+
+        x_norm = x_new / dst_w
+        y_norm = y_new / dst_h
+        w_norm = w_new / dst_w
+        h_norm = h_new / dst_h
+
+        x_norm = min(max(x_norm, 0.0), 1.0)
+        y_norm = min(max(y_norm, 0.0), 1.0)
+        w_norm = min(max(w_norm, 0.0), 1.0)
+        h_norm = min(max(h_norm, 0.0), 1.0)
+
+        parts[0] = str(dst_id)
+        parts[1] = f"{x_norm:.8f}"
+        parts[2] = f"{y_norm:.8f}"
+        parts[3] = f"{w_norm:.8f}"
+        parts[4] = f"{h_norm:.8f}"
+
+        counter[dst_id] += 1
+        output_lines.append(" ".join(parts))
+
+    return "\n".join(output_lines) + ("\n" if output_lines else ""), counter
 
 
 def normalize_names(raw: str | Sequence[str]) -> List[str]:
@@ -521,6 +641,7 @@ def build_dataset(
     )
 
     manifest_rows: List[Dict[str, str]] = []
+
     op = shutil.copy2 if config.operation == "copy" else shutil.move
 
     total_items = sum(len(v) for v in splits.values())
@@ -547,20 +668,63 @@ def build_dataset(
             if out_lbl.exists() and not config.overwrite:
                 raise FileExistsError(f"Output label already exists: {out_lbl}")
 
-            op(str(item.image_path), str(out_img))
+            if config.resize_enabled:
+                src_w, src_h, scale_x, scale_y, pad_x, pad_y = resize_image_yolo(
+                    src_img=item.image_path,
+                    dst_img=out_img,
+                    target_w=config.resize_width,
+                    target_h=config.resize_height,
+                    pad_black=config.resize_pad_black,
+                )
 
-            if item.label_path is not None:
-                label_text = item.label_path.read_text(encoding="utf-8")
-                rewritten, _label_counts = rewrite_label_text(label_text, config.merge_rules)
-                out_lbl.write_text(rewritten, encoding="utf-8")
+                if item.label_path is not None:
+                    label_text = item.label_path.read_text(encoding="utf-8")
+                    rewritten, _label_counts = rewrite_label_text_with_resize(
+                        label_text=label_text,
+                        merge_rules=config.merge_rules,
+                        src_w=src_w,
+                        src_h=src_h,
+                        dst_w=config.resize_width,
+                        dst_h=config.resize_height,
+                        scale_x=scale_x,
+                        scale_y=scale_y,
+                        pad_x=pad_x,
+                        pad_y=pad_y,
+                    )
+                    out_lbl.write_text(rewritten, encoding="utf-8")
+                else:
+                    out_lbl.write_text("", encoding="utf-8")
 
                 if config.operation == "move":
                     try:
-                        item.label_path.unlink()
+                        item.image_path.unlink()
                     except FileNotFoundError:
                         pass
+
+                    if item.label_path is not None:
+                        try:
+                            item.label_path.unlink()
+                        except FileNotFoundError:
+                            pass
+
             else:
-                out_lbl.write_text("", encoding="utf-8")
+                op(str(item.image_path), str(out_img))
+
+                if item.label_path is not None:
+                    label_text = item.label_path.read_text(encoding="utf-8")
+                    rewritten, _label_counts = rewrite_label_text(
+                        label_text,
+                        config.merge_rules,
+                    )
+                    out_lbl.write_text(rewritten, encoding="utf-8")
+
+                    if config.operation == "move":
+                        try:
+                            item.label_path.unlink()
+                        except FileNotFoundError:
+                            pass
+                else:
+                    out_lbl.write_text("", encoding="utf-8")
 
             manifest_rows.append(
                 {
@@ -574,6 +738,7 @@ def build_dataset(
             )
 
             processed_items += 1
+
             if progress_callback:
                 progress_callback(processed_items, total_items)
 
@@ -592,6 +757,18 @@ def build_dataset(
 
     final_stats["split_counts"] = {k: len(v) for k, v in splits.items()}
     final_stats["selected_pairs"] = [p.display() for p in pairs]
+
+    if config.resize_enabled:
+        final_stats["resize"] = {
+            "enabled": True,
+            "width": config.resize_width,
+            "height": config.resize_height,
+            "pad_black": config.resize_pad_black,
+        }
+    else:
+        final_stats["resize"] = {
+            "enabled": False,
+        }
 
     write_data_yaml(config.output_dir, config.id_to_name)
     write_reports(config.output_dir, final_stats, manifest_rows)
@@ -728,6 +905,11 @@ def launch_gui() -> None:
             "info_page": "使用說明",
             "custom_target_class_name": "自定義合併後類別名",
             "progress": "建立進度",
+            "progress": "建立進度",
+            "resize_output_image": "縮放輸出圖像",
+            "resize_width": "寬度",
+            "resize_height": "高度",
+            "keep_ratio_pad_black": "保持比例並填充黑邊",
         },
         "en": {
             "app_title": "YOLO Dataset Builder",
@@ -785,6 +967,11 @@ def launch_gui() -> None:
             "info_page": "Instructions",
             "custom_target_class_name": "Custom merged class name",
             "progress": "Build progress",
+            "progress": "Build progress",
+            "resize_output_image": "Resize output image",
+            "resize_width": "Width",
+            "resize_height": "Height",
+            "keep_ratio_pad_black": "Keep ratio and pad black",
         },
     }
 
@@ -808,6 +995,7 @@ def launch_gui() -> None:
 
             self._build_ui()
             self.refresh_language()
+            
 
         def t(self, key: str) -> str:
             return I18N.get(self.lang, I18N["en"]).get(key, key)
@@ -1014,6 +1202,10 @@ def launch_gui() -> None:
             self.overwrite_var = tk.BooleanVar(value=False)
             self.operation_var = tk.StringVar(value="copy")
             self.seed_var = tk.StringVar(value="42")
+            self.resize_enabled_var = tk.BooleanVar(value=False)
+            self.resize_width_var = tk.StringVar(value="640")
+            self.resize_height_var = tk.StringVar(value="640")
+            self.resize_pad_black_var = tk.BooleanVar(value=True)
 
             self.bind_i18n(ttk.Label(opts), "image_folder_names").grid(row=0, column=0, sticky="w", **pad)
             ttk.Entry(opts, textvariable=self.image_names_var, width=40).grid(row=0, column=1, sticky="we", **pad)
@@ -1052,6 +1244,47 @@ def launch_gui() -> None:
                 ttk.Checkbutton(opts, variable=self.include_unlabeled_var),
                 "include_unlabeled",
             ).grid(row=2, column=3, sticky="w", **pad)
+            resize_frame = ttk.Frame(opts)
+            resize_frame.grid(row=3, column=0, columnspan=4, sticky="w", padx=8, pady=5)
+
+            self.bind_i18n(
+                ttk.Checkbutton(
+                    resize_frame,
+                    variable=self.resize_enabled_var,
+                ),
+                "resize_output_image",
+            ).pack(side="left", padx=(0, 14))
+
+            self.bind_i18n(
+                ttk.Label(resize_frame),
+                "resize_width",
+            ).pack(side="left", padx=(0, 4))
+
+            ttk.Entry(
+                resize_frame,
+                textvariable=self.resize_width_var,
+                width=8,
+            ).pack(side="left", padx=(0, 12))
+
+            self.bind_i18n(
+                ttk.Label(resize_frame),
+                "resize_height",
+            ).pack(side="left", padx=(0, 4))
+
+            ttk.Entry(
+                resize_frame,
+                textvariable=self.resize_height_var,
+                width=8,
+            ).pack(side="left", padx=(0, 12))
+
+            self.bind_i18n(
+                ttk.Checkbutton(
+                    resize_frame,
+                    variable=self.resize_pad_black_var,
+                ),
+                "keep_ratio_pad_black",
+            ).pack(side="left", padx=(0, 0))
+
 
             opts.columnconfigure(1, weight=1)
             opts.columnconfigure(3, weight=1)
@@ -1519,6 +1752,11 @@ def launch_gui() -> None:
                 overwrite=self.overwrite_var.get(),
                 include_unlabeled=self.include_unlabeled_var.get(),
                 seed=int(self.seed_var.get()),
+
+                resize_enabled=self.resize_enabled_var.get(),
+                resize_width=int(self.resize_width_var.get()),
+                resize_height=int(self.resize_height_var.get()),
+                resize_pad_black=self.resize_pad_black_var.get(),
             )
 
         def analyze(self):
@@ -1632,7 +1870,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--include-unlabeled", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--analyze-only", action="store_true")
-
+    parser.add_argument("--resize", action="store_true", help="Resize output images")
+    parser.add_argument("--resize-width", type=int, default=640)
+    parser.add_argument("--resize-height", type=int, default=640)
+    parser.add_argument(
+        "--no-pad-black",
+        action="store_true",
+        help="Resize by stretching instead of keeping aspect ratio with black padding",
+    )
     return parser.parse_args(argv)
 
 
@@ -1678,6 +1923,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         overwrite=args.overwrite,
         include_unlabeled=args.include_unlabeled,
         seed=args.seed,
+        resize_enabled=args.resize,
+        resize_width=args.resize_width,
+        resize_height=args.resize_height,
+        resize_pad_black=not args.no_pad_black,
     )
 
     pairs = scan_folder_pairs(config.parent_dir, config.image_dir_names, config.label_dir_names)
