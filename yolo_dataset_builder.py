@@ -560,6 +560,57 @@ def write_data_yaml(output_dir: Path, id_to_name: Dict[int, str]) -> None:
         encoding="utf-8",
     )
 
+def verify_resized_outputs(
+    manifest_rows: List[Dict[str, str]],
+    target_w: int,
+    target_h: int,
+) -> Dict[str, object]:
+    errors = []
+    checked_images = 0
+    checked_labels = 0
+
+    for row in manifest_rows:
+        img_path = Path(row["output_image"])
+        lbl_path = Path(row["output_label"])
+
+        checked_images += 1
+
+        try:
+            with Image.open(img_path) as im:
+                w, h = im.size
+
+            if w != target_w or h != target_h:
+                errors.append(f"Image size mismatch: {img_path} got {w}x{h}, expected {target_w}x{target_h}")
+        except Exception as exc:
+            errors.append(f"Cannot read image: {img_path}: {exc}")
+
+        if lbl_path.exists():
+            checked_labels += 1
+            try:
+                for line_no, raw in enumerate(lbl_path.read_text(encoding="utf-8").splitlines(), start=1):
+                    line = raw.strip()
+                    if not line:
+                        continue
+
+                    parts = line.split()
+                    if len(parts) < 5:
+                        errors.append(f"Invalid label line: {lbl_path}:{line_no}: {raw}")
+                        continue
+
+                    x, y, bw, bh = map(float, parts[1:5])
+
+                    if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0 and 0.0 < bw <= 1.0 and 0.0 < bh <= 1.0):
+                        errors.append(f"YOLO bbox out of range: {lbl_path}:{line_no}: {raw}")
+
+            except Exception as exc:
+                errors.append(f"Cannot read label: {lbl_path}: {exc}")
+
+    return {
+        "valid": len(errors) == 0,
+        "checked_images": checked_images,
+        "checked_labels": checked_labels,
+        "errors": errors,
+    }
 
 def write_reports(
     output_dir: Path,
@@ -592,6 +643,10 @@ def write_reports(
                 "output_image",
                 "output_label",
                 "operation",
+                "resize_enabled",
+                "resize_width",
+                "resize_height",
+                "resize_pad_black",
             ],
         )
         writer.writeheader()
@@ -734,6 +789,10 @@ def build_dataset(
                     "output_image": str(out_img),
                     "output_label": str(out_lbl),
                     "operation": config.operation,
+                    "resize_enabled": str(config.resize_enabled),
+                    "resize_width": str(config.resize_width if config.resize_enabled else ""),
+                    "resize_height": str(config.resize_height if config.resize_enabled else ""),
+                    "resize_pad_black": str(config.resize_pad_black if config.resize_enabled else ""),
                 }
             )
 
@@ -759,12 +818,26 @@ def build_dataset(
     final_stats["selected_pairs"] = [p.display() for p in pairs]
 
     if config.resize_enabled:
+        resize_check = verify_resized_outputs(
+            manifest_rows=manifest_rows,
+            target_w=config.resize_width,
+            target_h=config.resize_height,
+        )
+
         final_stats["resize"] = {
             "enabled": True,
             "width": config.resize_width,
             "height": config.resize_height,
             "pad_black": config.resize_pad_black,
+            "verified": resize_check["valid"],
+            "checked_images": resize_check["checked_images"],
+            "checked_labels": resize_check["checked_labels"],
+            "errors": resize_check["errors"][:50],
         }
+
+        if not resize_check["valid"]:
+            preview = "\n".join(resize_check["errors"][:10])
+            raise RuntimeError(f"Resize verification failed:\n{preview}")
     else:
         final_stats["resize"] = {
             "enabled": False,
@@ -847,7 +920,8 @@ def format_stats_localized(stats: Dict[str, object], lang: str = "en") -> str:
 def launch_gui() -> None:
     import tkinter as tk
     from tkinter import filedialog, messagebox, scrolledtext, ttk
-
+    import threading
+    import queue
     I18N = {
         "zh": {
             "app_title": "YOLO 資料集產生工具",
@@ -995,8 +1069,58 @@ def launch_gui() -> None:
 
             self._build_ui()
             self.refresh_language()
+            self.bulid_thread = None
+            self.build_queue = queue.Queue()
+            self.is_building = False
             
+        
+        def enqueue_build_progress(self, current: int, total: int):
+            self.build_queue.put(("progress", current, total))
 
+
+        def poll_build_queue(self):
+            try:
+                while True:
+                    msg = self.build_queue.get_nowait()
+                    msg_type = msg[0]
+
+                    if msg_type == "progress":
+                        _msg_type, current, total = msg
+                        self.update_build_progress(current, total)
+
+                    elif msg_type == "done":
+                        _msg_type, stats, output_dir = msg
+
+                        self.is_building = False
+                        self.update_build_progress(0, 0)
+
+                        self.write_status(
+                            self.t("build_completed")
+                            + "\n\n"
+                            + format_stats_localized(stats, self.lang)
+                            + f"\n\n{self.t('output')}: {Path(output_dir).resolve()}"
+                        )
+
+                        messagebox.showinfo(
+                            self.t("completed"),
+                            f"{self.t('dataset_generated')}:\n{Path(output_dir).resolve()}",
+                        )
+
+                    elif msg_type == "error":
+                        _msg_type, error_text, traceback_text = msg
+
+                        self.is_building = False
+                        self.write_status(traceback_text)
+                        messagebox.showerror(self.t("error"), error_text)
+
+            except queue.Empty:
+                pass
+
+            if self.is_building:
+                self.after(100, self.poll_build_queue)
+
+
+        
         def t(self, key: str) -> str:
             return I18N.get(self.lang, I18N["en"]).get(key, key)
 
@@ -1788,6 +1912,13 @@ def launch_gui() -> None:
 
         def build(self):
             try:
+                if self.is_building:
+                    messagebox.showwarning(
+                        self.t("warning"),
+                        "Dataset build is already running.",
+                    )
+                    return
+
                 if self.operation_var.get() == "move":
                     ok = messagebox.askyesno(
                         self.t("move_source_files_title"),
@@ -1803,27 +1934,46 @@ def launch_gui() -> None:
                 self.update_class_options(write_message=False)
 
                 config = self.make_config()
+                pairs = list(self.pairs)
+
+                self.is_building = True
                 self.update_build_progress(0, 0)
 
-                stats = build_dataset(
-                    config,
-                    pairs=self.pairs,
-                    progress_callback=self.update_build_progress,
-                )
+                def worker():
+                    try:
+                        stats = build_dataset(
+                            config,
+                            pairs=pairs,
+                            progress_callback=self.enqueue_build_progress,
+                        )
 
-                self.write_status(
-                    self.t("build_completed")
-                    + "\n\n"
-                    + format_stats_localized(stats, self.lang)
-                    + f"\n\n{self.t('output')}: {config.output_dir.resolve()}"
-                )
+                        self.build_queue.put(
+                            (
+                                "done",
+                                stats,
+                                str(config.output_dir),
+                            )
+                        )
 
-                messagebox.showinfo(
-                    self.t("completed"),
-                    f"{self.t('dataset_generated')}:\n{config.output_dir.resolve()}",
+                    except Exception as exc:
+                        self.build_queue.put(
+                            (
+                                "error",
+                                str(exc),
+                                traceback.format_exc(),
+                            )
+                        )
+
+                self.build_thread = threading.Thread(
+                    target=worker,
+                    daemon=True,
                 )
+                self.build_thread.start()
+
+                self.after(100, self.poll_build_queue)
 
             except Exception as exc:
+                self.is_building = False
                 self.show_error(exc)
 
         def write_status(self, text):
