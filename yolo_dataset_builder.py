@@ -1854,7 +1854,17 @@ def launch_gui() -> None:
             self.update_class_options(write_message=False)
 
         def make_config(self) -> BuildConfig:
-            id_to_name, merge_rules = self.make_final_class_plan()
+            original_id_to_name = self.get_current_id_to_name()
+
+            # 沒有設定合併規則時：
+            # 保留原始 class id，不重新壓縮、不重新編號。
+            if not self.gui_merge_rules and not self.custom_merged_class_names:
+                id_to_name = original_id_to_name
+                merge_rules = {}
+            else:
+                # 有合併規則時：
+                # 維持原本 GUI 的合併功能，產生新的 final class id。
+                id_to_name, merge_rules = self.make_final_class_plan()
 
             selected = list(self.pair_list.curselection()) if self.pairs else None
 
@@ -1876,7 +1886,6 @@ def launch_gui() -> None:
                 overwrite=self.overwrite_var.get(),
                 include_unlabeled=self.include_unlabeled_var.get(),
                 seed=int(self.seed_var.get()),
-
                 resize_enabled=self.resize_enabled_var.get(),
                 resize_width=int(self.resize_width_var.get()),
                 resize_height=int(self.resize_height_var.get()),
